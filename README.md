@@ -28,7 +28,7 @@ May need experimental version of ffmpeg or older version of torch.
 
 Finally install this library from source:
 ```shell
-git clone https://github.com/resemble-ai/chatterbox.git
+git clone https://github.com/Beskamir/chatterbox-turbo-stream
 cd chatterbox
 py -3.11 -m pip install -e .
 ```

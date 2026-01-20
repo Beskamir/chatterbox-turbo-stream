@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/resemble-ai/chatterbox"
-Repository = "https://github.com/resemble-ai/chatterbox"
+Homepage = "https://github.com/Beskamir/chatterbox-turbo-stream"
+Repository = "https://github.com/Beskamir/chatterbox-turbo-stream"
 
 [build-system]
 requires = ["setuptools>=61.0"]
