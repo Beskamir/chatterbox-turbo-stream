@@ -14,12 +14,11 @@ Install torch depedancy with cuda:
 ```shell
 py -3.11 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 ```
-Other versions may work better, but this is what I used.
-Torchvision is probably entirely unnecessary.
-Torchaudio might have issues with ffmpeg. It's why I switched to soundfile in the audio_saver class, but there are still uses of torchaudio elsewhere in this project and those will likely be very broken.
+- Other versions may work better, but this is what I used.
+- Torchvision is probably entirely unnecessary.
+- Torchaudio might have issues with ffmpeg. It's why I switched to soundfile in the audio_saver class, but there are still uses of torchaudio elsewhere in this project and those will likely be very broken.
 
-(Potentially optional since I switched to soundfile)
-Install ffmpeg:
+Install ffmpeg: (Potentially optional since I switched to soundfile)
 ```shell
 winget install ffmpeg
 ```
@@ -76,9 +75,12 @@ audioPlayer.stop()
 
 Search `Debug Note` in the repository to find optional print/debug sections I removed for performance reasons.
 
+### Major changes:
 Main files I modified or added are chatterbox/audio_player.py, chatterbox/audio_saver.py, chatterbox/tts_turbo.py, chatterbox/models/t3/t3.py, and example_stream_tts_turbo.py
 
-Also changed the S3GEN_SR constant in chatterbox/models/s3gen/const.py since 24000 seemed too fast while 23000 was much nicer, and removed LoRACompatibleLinear from chatterbox/models/s3gen/matcha/transformer.py since it was giving me a deprecation warning, but I didn't get around to replacing it with PEFT, so if fine tuning is important to you then go look into how to do that properly. For me a simple nn.Linear was sufficient. This is likely more of a training than inference thing anyway so probably fine to just leave it like this.
+### Minor changes: 
+- Changed the S3GEN_SR constant in chatterbox/models/s3gen/const.py since 24000 seemed too fast while 23000 was much nicer
+- Removed LoRACompatibleLinear from chatterbox/models/s3gen/matcha/transformer.py since it was giving me a deprecation warning, but I didn't get around to replacing it with PEFT, so if fine tuning is important to you then go look into how to do that properly. For me a simple nn.Linear was sufficient. This is likely more of a training than inference thing anyway so probably fine to just leave it like this.
 
 ---
 
@@ -86,46 +88,46 @@ Also changed the S3GEN_SR constant in chatterbox/models/s3gen/const.py since 240
 
 ## Laptop RTX3070ti
 
-Generating Audio Chunks:
-Generated audio chunk in 1.72 seconds
-Generated audio chunk in 1.06 seconds
-Generated audio chunk in 1.02 seconds
-Generated audio chunk in 0.90 seconds
-Generated audio chunk in 1.02 seconds
-Generated audio chunk in 0.88 seconds
-Generated audio chunk in 0.89 seconds
-Generated audio chunk in 0.94 seconds
-**Total generating time 8.43 seconds, but latency to first audio chunk is 1.72s.**
+- Generating Audio Chunks:
+- Generated audio chunk in 1.72 seconds
+- Generated audio chunk in 1.06 seconds
+- Generated audio chunk in 1.02 seconds
+- Generated audio chunk in 0.90 seconds
+- Generated audio chunk in 1.02 seconds
+- Generated audio chunk in 0.88 seconds
+- Generated audio chunk in 0.89 seconds
+- Generated audio chunk in 0.94 seconds
+- **Total generating time 8.43 seconds, but latency to first audio chunk is 1.72s.**
 
-Generating audio with Chatterbox's normal turbo generator:
-**Generates entire audio without streaming in 6.28 seconds, and only then plays the generated audio.**
+- Generating audio with Chatterbox's normal turbo generator:
+- **Generates entire audio without streaming in 6.28 seconds, and only then plays the generated audio.**
 
 ## Desktop RTX2080
 
-Generating Audio Chunks:
-Generated audio chunk in 2.42 seconds
-Generated audio chunk in 1.68 seconds
-Generated audio chunk in 1.77 seconds
-Generated audio chunk in 1.70 seconds
-Generated audio chunk in 1.72 seconds
-Generated audio chunk in 1.70 seconds
-Generated audio chunk in 1.72 seconds
-Generated audio chunk in 1.68 seconds
-Generated audio chunk in 1.47 seconds
-**Total generating time: 15.85 seconds, but latency to first audio chunk is 2.42s.**
+- Generating Audio Chunks:
+- Generated audio chunk in 2.42 seconds
+- Generated audio chunk in 1.68 seconds
+- Generated audio chunk in 1.77 seconds
+- Generated audio chunk in 1.70 seconds
+- Generated audio chunk in 1.72 seconds
+- Generated audio chunk in 1.70 seconds
+- Generated audio chunk in 1.72 seconds
+- Generated audio chunk in 1.68 seconds
+- Generated audio chunk in 1.47 seconds
+- **Total generating time: 15.85 seconds, but latency to first audio chunk is 2.42s.**
 
-Saved streaming audio to: output-streamer.wav
-Total streaming chunks: 9
-Final audio shape: torch.Size([1, 426240])
-Final audio duration: 18.532s
+- Saved streaming audio to: output-streamer.wav
+- Total streaming chunks: 9
+- Final audio shape: torch.Size([1, 426240])
+- Final audio duration: 18.532s
 
-Generating audio with Chatterbox's normal turbo generator:
-**Generates entire audio without streaming in 13.75 seconds, and only then plays the generated audio.**
+- Generating audio with Chatterbox's normal turbo generator:
+- **Generates entire audio without streaming in 13.75 seconds, and only then plays the generated audio.**
 
-Saved streaming audio to: output-normal.wav
-Total streaming chunks: 1
-Final audio shape: torch.Size([1, 447360])
-Final audio duration: 19.450s
+- Saved streaming audio to: output-normal.wav
+- Total streaming chunks: 1
+- Final audio shape: torch.Size([1, 447360])
+- Final audio duration: 19.450s
 
 ---
 
