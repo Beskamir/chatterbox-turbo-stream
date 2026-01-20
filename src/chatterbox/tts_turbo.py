@@ -2,10 +2,12 @@ import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
+import time
+from typing import Generator, Tuple, Optional
 
 import librosa
 import torch
-import perth
+# import perth
 import pyloudnorm as ln
 
 from safetensors.torch import load_file
@@ -13,15 +15,18 @@ from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from .models.t3 import T3
-from .models.s3tokenizer import S3_SR
+from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
-import logging
-logger = logging.getLogger(__name__)
+import numpy as np
+
+import torchaudio.functional as F
+# import logging
+# logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
@@ -43,8 +48,11 @@ def punc_norm(text: str) -> str:
 
     # Replace uncommon/llm punc
     punc_to_replace = [
+        ("...", ", "),
         ("…", ", "),
         (":", ","),
+        (" - ", ", "),
+        (";", ", "),
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
@@ -106,10 +114,20 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
+@dataclass
+class StreamingMetrics:
+    """Metrics for streaming TTS generation"""
+    latency_to_first_chunk: Optional[float] = None
+    rtf: Optional[float] = None
+    total_generation_time: Optional[float] = None
+    total_audio_duration: Optional[float] = None
+    chunk_count: int = 0
 
 class ChatterboxTurboTTS:
     ENC_COND_LEN = 15 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
+
+    voices = {}
 
     def __init__(
         self,
@@ -127,7 +145,8 @@ class ChatterboxTurboTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self._prev_chunk = None
+        # self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTurboTTS':
@@ -194,7 +213,7 @@ class ChatterboxTurboTTS:
 
         local_path = snapshot_download(
             repo_id=REPO_ID,
-            token=os.getenv("HF_TOKEN") or True,
+            token=False,
             # Optional: Filter to download only what you need
             allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
         )
@@ -214,58 +233,53 @@ class ChatterboxTurboTTS:
 
         return wav
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
-        ## Load and norm reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+    def audio_sample(self, wav_fpath, exaggeration=0.0, norm_loudness=True):
+        """
+            Method for supplying a voice sample. Must be 5 seconds or longer.
+        """
+        if(wav_fpath not in self.voices):
+            ## Load and norm reference wav
+            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
-        assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
+            assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
 
-        if norm_loudness:
-            s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
+            if norm_loudness:
+                s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
 
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+            ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
-        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+            s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+            s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
-        # Speech cond prompt tokens
-        if plen := self.t3.hp.speech_cond_prompt_len:
-            s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+            # Speech cond prompt tokens
+            if plen := self.t3.hp.speech_cond_prompt_len:
+                s3_tokzr = self.s3gen.tokenizer
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+                t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
 
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+            # Voice-encoder speaker embedding
+            ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+            ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
-        t3_cond = T3Cond(
-            speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+            t3_cond = T3Cond(
+                speaker_emb=ve_embed,
+                cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+            # self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+            self.voices[wav_fpath] = Conditionals(t3_cond, s3gen_ref_dict)
+
+        self.conds = self.voices[wav_fpath]
+        self._prev_chunk = None
 
     def generate(
         self,
         text,
-        repetition_penalty=1.2,
-        min_p=0.00,
-        top_p=0.95,
-        audio_prompt_path=None,
-        exaggeration=0.0,
-        cfg_weight=0.0,
         temperature=0.8,
         top_k=1000,
-        norm_loudness=True,
+        top_p=0.95,
+        repetition_penalty=1.2,
     ):
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-
-        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
-
         # Norm and tokenize text
         text = punc_norm(text)
         text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
@@ -291,6 +305,170 @@ class ChatterboxTurboTTS:
             ref_dict=self.conds.gen,
             n_cfm_timesteps=2,
         )
-        wav = wav.squeeze(0).detach().cpu().numpy()
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+        return wav.detach().cpu()
+        
+    def _process_token_buffer(
+        self,
+        token_buffer,
+        all_tokens_so_far,
+        context_window,
+        fade_duration=0.002,
+        crossfade_duration=0.004,
+        zero_crossing_range=2,
+    ):
+        """
+            Helper method for converting tokens into audio
+            token_buffer: The select tokens to be converted into audio
+            all_tokens_so_far: All the tokens generated so far
+            context_window: How many already generated tokens should be included
+            fade_duration: Seconds to apply linear fade in & out on each chunk
+            crossfade_duration, Seconds to apply crossfade between chunks
+            zero_crossing_range, Seconds to search for a zero crossing
+        """
+        # Combine buffered chunks of tokens
+        new_tokens = torch.cat(token_buffer, dim=-1)
+
+        # Build tokens_to_process by including a context window
+        if len(all_tokens_so_far) > 0:
+            context_tokens = (
+                all_tokens_so_far[-context_window:]
+                if len(all_tokens_so_far) > context_window
+                else all_tokens_so_far
+            )
+            tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1)
+            context_length = len(context_tokens)
+        else:
+            tokens_to_process = new_tokens
+            context_length = 0
+
+        # Drop any invalid tokens and move to the correct device
+        clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        if len(clean_tokens) == 0:
+            return None, False
+
+        # Run S3Gen inference to get a waveform (1 × T)
+        wav, _ = self.s3gen.inference(
+            speech_tokens=clean_tokens,
+            ref_dict=self.conds.gen,
+            n_cfm_timesteps=2
+        )
+
+        wav = wav.squeeze(0).cpu()
+
+        # If we have context tokens, crop out the samples corresponding to them
+        if context_length > 0:
+            samples_per_token = wav.shape[-1] // clean_tokens.shape[-1]
+            skip_samples = context_length * samples_per_token
+            audio_chunk = wav[skip_samples:]
+        else:
+            audio_chunk = wav
+
+        if audio_chunk.shape[-1] == 0:
+            return None, False
+
+        audio_chunk = audio_chunk.clone()
+        fade_len = int(fade_duration * self.sr)
+        fade_in = torch.linspace(0.0, 1.0, fade_len)
+        fade_out = torch.linspace(1.0, 0.0, fade_len)
+        audio_chunk[:fade_len] *= fade_in
+        audio_chunk[-fade_len:] *= fade_out
+
+        # --- ZERO CROSSING STITCHING ---
+        # If we have a previous chunk, find zero crossing near boundary
+        if self._prev_chunk is not None:
+            prev_chunk = self._prev_chunk
+            # Look at last N samples of previous chunk + first N samples of new chunk
+            max_search = min(len(prev_chunk), len(audio_chunk), int(self.sr * zero_crossing_range))
+            boundary_region = torch.cat([prev_chunk[-max_search:], audio_chunk[:max_search]])
+
+            # Find first zero-crossing in new chunk portion
+            zero_crossings = torch.where(boundary_region[:-1] * boundary_region[1:] <= 0)[0]
+            zero_crossings = zero_crossings[zero_crossings >= max_search]  # only in new chunk
+            if len(zero_crossings) > 0:
+                audio_chunk = audio_chunk[zero_crossings[0]-max_search:]  # trim to zero crossing
+
+            # Optional: minimal crossfade to avoid tiny discontinuities
+            crossfade_samples = min(int(self.sr * crossfade_duration), len(prev_chunk), len(audio_chunk))
+            if crossfade_samples > 0:
+                fade_in = torch.linspace(0.0, 1.0, crossfade_samples)
+                fade_out = torch.linspace(1.0, 0.0, crossfade_samples)
+                audio_chunk[:crossfade_samples] = audio_chunk[:crossfade_samples] * fade_in + prev_chunk[-crossfade_samples:] * fade_out
+
+        # Save current chunk for next iteration
+        self._prev_chunk = audio_chunk.clone()
+
+        audio_tensor = audio_chunk.unsqueeze(0)
+
+        return audio_tensor, True
+
+    def generate_stream(
+        self,
+        text: str,
+        chunk_size: int = 50,
+        context_window: int = 500,
+        fade_duration: float=0.002,
+        crossfade_duration: float=0.004,
+        zero_crossing_range: float=2.0,
+        temperature: float = 0.8,
+        top_k: float=1000,
+        top_p: float=0.95,
+        repetition_penalty: float=1.2,
+        max_new_tokens: int=1000
+    ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+        """
+        Streaming version of generate that yields audio chunks as they are generated.
+        
+        Args:
+            text: Input text to synthesize
+            chunk_size: Number of speech tokens per chunk
+            context_window: How many already generated tokens should be included
+            fade_duration: Seconds to apply linear fade in & out on each chunk
+            crossfade_duration, Seconds to apply crossfade between chunks
+            zero_crossing_range, Seconds to search for a zero crossing
+            temperature: Controls randomness (larger: random, smaller: deterministic)
+            top_k: keeps most likely tokens (larger: unstable, smaller: robotic)
+            top_p: keeps smallest set of tokens with probability > p
+            repetition_penalty: Penalizes tokens that were already generated
+            max_new_tokens: This seems like it might be necessary to avoid issues
+        Yields:
+            audio_chunk is a torch.Tensor
+        """
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        # Presumably this pads text with start of text and end of text tokens
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = torch.nn.functional.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = torch.nn.functional.pad(text_tokens, (0, 1), value=eot)
+
+        all_tokens_processed = []  # Keep track of all tokens processed so far
+        
+        for token_chunk in self.t3.inference_turbo_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k = top_k,
+            top_p = top_p,
+            repetition_penalty = repetition_penalty,
+            max_new_tokens=max_new_tokens,
+            chunk_size=chunk_size,
+        ):
+            # Extract only the conditional batch
+            token_chunk = token_chunk[0]
+                
+            # Process each chunk immediately
+            audio_tensor, success = self._process_token_buffer([token_chunk], all_tokens_processed, context_window, fade_duration, crossfade_duration, zero_crossing_range)
+
+            if success:
+                yield audio_tensor
+
+            # Update all_tokens_processed with the new tokens
+            if len(all_tokens_processed) == 0:
+                all_tokens_processed = token_chunk
+            else:
+                all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+

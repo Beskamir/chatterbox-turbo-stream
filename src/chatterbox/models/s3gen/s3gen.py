@@ -360,3 +360,38 @@ class S3Token2Wav(S3Token2Mel):
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
         return output_wavs, output_sources
+
+    @torch.inference_mode()
+    def inference_stream(
+        self,
+        speech_tokens,
+        # locally-computed ref embedding (mutex with ref_dict)
+        ref_wav: Optional[torch.Tensor] = None,
+        ref_sr: Optional[int] = None,
+        # pre-computed ref embedding (prod API)
+        ref_dict: Optional[dict] = None,
+        # left as a kwarg because this can change input/output size ratio
+        drop_invalid_tokens=True,
+        n_cfm_timesteps=None,
+        speech_token_lens=None,
+    ):
+        # hallucination prevention, drop special tokens
+        # if drop_invalid_tokens:
+        #     speech_tokens, speech_token_lens = drop_invalid(speech_tokens, pad=S3_QUIET_PAD)
+
+        output_mels = self.flow_inference(
+            speech_tokens,
+            speech_token_lens=speech_token_lens,
+            ref_wav=ref_wav,
+            ref_sr=ref_sr,
+            ref_dict=ref_dict,
+            n_cfm_timesteps=n_cfm_timesteps,
+            finalize=True,
+        )
+        output_mels = output_mels.to(dtype=self.dtype) # FIXME (fp16 mode) is this still needed?
+        output_wavs, output_sources = self.hift_inference(output_mels, None)
+
+        # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
+        output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+
+        return output_wavs, output_sources

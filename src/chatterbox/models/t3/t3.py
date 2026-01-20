@@ -5,7 +5,7 @@ from typing import Union, Optional, List
 
 logger = logging.getLogger(__name__)
 
-from tqdm import tqdm
+# from tqdm import tqdm # Debug Note: Uncomment this for progress bars
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
@@ -27,9 +27,10 @@ from .inference.t3_hf_backend import T3HuggingfaceBackend
 from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 from ..utils import AttrDict
 
+from ..s3gen.const import S3GEN_SIL
+from typing import Generator, Tuple, Optional
 
-logger = logging.getLogger(__name__)
-
+import time
 
 def _ensure_BOT_EOT(text_tokens: Tensor, hp):
     B = text_tokens.size(0)
@@ -349,7 +350,9 @@ class T3(nn.Module):
         past = output.past_key_values
 
         # ---- Generation Loop using kv_cache ----
-        for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        # Debug Note: wrap this in tqdm to enable progress bars
+        # for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        for i in range(max_new_tokens, desc="Sampling", dynamic_ncols=True):
             logits_step = output.logits[:, -1, :]
             # CFG combine  → (1, V)
             cond   = logits_step[0:1, :]
@@ -454,7 +457,9 @@ class T3(nn.Module):
         generated_speech_tokens.append(next_speech_token)
         current_speech_token = next_speech_token
 
-        for _ in tqdm(range(max_gen_len)):
+        # Debug Note: Wrap this in tqdm to enable progress bar
+        # for _ in tqdm(range(max_gen_len)):
+        for _ in range(max_gen_len):
             current_speech_embed = self.speech_emb(current_speech_token)
 
             llm_outputs = self.tfmr(
@@ -488,3 +493,130 @@ class T3(nn.Module):
             all_tokens = all_tokens[:, :-1]
 
         return all_tokens
+
+    @torch.inference_mode()
+    def inference_turbo_stream(
+        self, 
+        t3_cond, 
+        text_tokens, 
+        temperature=0.8, 
+        top_k=1000, 
+        top_p=0.95, 
+        repetition_penalty=1.2, 
+        max_new_tokens=1000, # Maybe this limit is necessary?
+        chunk_size=50 # Number of tokens per chunk
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+            Streaming version of T3 inference that yields speech tokens in chunks.
+        """
+        # Build logits processors
+        logits_processors = LogitsProcessorList()
+        if temperature > 0 and temperature != 1.0:
+            logits_processors.append(TemperatureLogitsWarper(temperature))
+        if top_k > 0:
+            logits_processors.append(TopKLogitsWarper(top_k))
+        if top_p < 1.0:
+            logits_processors.append(TopPLogitsWarper(top_p))
+        if repetition_penalty != 1.0:
+            logits_processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+
+        speech_start_token = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+
+        # Cached for faster access in the loop, likely makes no measurable impact
+        tfmr = self.tfmr
+        speech_emb = self.speech_emb
+        speech_head = self.speech_head
+        stop_token = self.hp.stop_speech_token
+
+
+        embeds, _ = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=speech_start_token,
+            cfg_weight=0.0,
+        )
+
+        llm_outputs = tfmr(
+            inputs_embeds=embeds,
+            use_cache=True
+        )
+
+        hidden_states = llm_outputs[0]
+        past_key_values = llm_outputs.past_key_values
+
+        speech_hidden = hidden_states[:, -1:]
+        speech_logits = speech_head(speech_hidden)
+
+        processed_logits = logits_processors(speech_start_token, speech_logits[:, -1, :])
+        probs = F.softmax(processed_logits, dim=-1)
+        current_token = torch.multinomial(probs, num_samples=1)
+
+        generated_ids = current_token
+        chunk_buffer = [None] * chunk_size
+
+        chunk_index = 0
+
+        # Debug Note: Wrap this in tqdm to enable progress bar
+        # for _ in tqdm(range(max_gen_len)):
+        for _ in range(max_new_tokens):
+            current_speech_embed = speech_emb(current_token)
+
+            llm_outputs = tfmr(
+                inputs_embeds=current_speech_embed,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+            
+            past_key_values = llm_outputs.past_key_values
+            hidden_states = llm_outputs[0]
+            speech_logits = speech_head(hidden_states)
+
+            # input_ids = torch.cat(generated_speech_tokens, dim=1)
+            processed_logits = logits_processors(generated_ids, speech_logits[:, -1, :])
+
+            # if torch.all(processed_logits == -float("inf")):
+            if not torch.isfinite(processed_logits).any():
+                print("Warning: All logits are -inf")
+                break
+
+            probs = F.softmax(processed_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            current_token = next_token
+            chunk_buffer[chunk_index] = next_token
+            chunk_index += 1
+
+            # Check for EOS (end of sentence) token
+            if (next_token == stop_token).all():
+                # Remove the EOS token and anything beyond it
+                live_tokens = chunk_buffer[:chunk_index-1]
+
+                # Generate silence
+                silence = torch.full(
+                    (next_token.shape[0], 3),
+                    S3GEN_SIL,
+                    dtype=torch.long,
+                    device=next_token.device,
+                )
+
+                # Add the silence to the end of the audio chunk
+                if chunk_index>1:
+                    token_chunk = torch.cat(live_tokens, dim=1)
+                    yield torch.cat([token_chunk, silence], dim=1)
+                else:
+                    yield silence
+
+                break
+
+            # Yield chunk when buffer is full
+            if chunk_index >= chunk_size:
+                # Send the filled buffer back to the code that called this method
+                yield torch.cat(chunk_buffer, dim=1)
+
+                # Reset chunk buffer to an array of None
+                for j in range(len(chunk_buffer)):
+                    chunk_buffer[j]=None
+
+                # Reset index after sending the filled buffer
+                chunk_index = 0
